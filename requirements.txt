@@ -1,0 +1,7 @@
+fastapi>=0.115,<1
+uvicorn>=0.30,<1
+pydantic>=2,<3
+requests>=2.31,<3
+flet[all]>=0.80,<1
+pytest>=8,<10
+httpx>=0.27,<1
