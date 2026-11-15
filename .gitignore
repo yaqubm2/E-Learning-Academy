@@ -2,8 +2,8 @@
 __pycache__/
 .pytest_cache/
 *.py[cod]
+academy.sqlite3
 *.sqlite3
 .env
-.build/
 build/
 dist/

@@ -1,184 +1,303 @@
-"""Family-mode API. Local development only: no production authentication or isolation."""
-import os
+"""Role-scoped family API; local prototype, not a publicly deployable auth service."""
+import hashlib
+import hmac
+import json
+import re
 import secrets
+import sqlite3
 import time
 from contextlib import asynccontextmanager
 from typing import Literal
 
-from fastapi import Depends, FastAPI, Header, HTTPException, status
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field, field_validator
-
 from . import store
 
-PARENT_PIN = os.getenv('ACADEMY_PARENT_PIN', '2468')
-ADMIN_TOKENS: dict[str,float] = {}
+# Server-memory sessions reset after backend restart. Use HTTPS and persistent
+# session management, rate-limits, CSRF strategy etc. before public deployment.
+SESSIONS = {}
+SESSION_SECONDS = 8 * 3600
+
+def hash_secret(secret):
+    salt=secrets.token_bytes(16)
+    digest=hashlib.pbkdf2_hmac('sha256',secret.encode(),salt,260000)
+    return f'{salt.hex()}:{digest.hex()}'
+
+def verify_secret(secret, encoded):
+    if not encoded: return False
+    try:
+        salt, digest = encoded.split(':')
+        actual=hashlib.pbkdf2_hmac('sha256',secret.encode(),bytes.fromhex(salt),260000)
+        return hmac.compare_digest(actual,bytes.fromhex(digest))
+    except (ValueError,TypeError):
+        return False
+
+def issue_session(role, user_id):
+    token=secrets.token_urlsafe(32)
+    SESSIONS[token]=(role,user_id,time.time()+SESSION_SECONDS)
+    return {'access_token':token,'role':role,'expires_in':SESSION_SECONDS}
+
+def current_session(authorization: str|None=Header(default=None)):
+    token=authorization.removeprefix('Bearer ').strip() if authorization else ''
+    data=SESSIONS.get(token)
+    if not data or data[2] < time.time():
+        raise HTTPException(401,'Please log in')
+    return data[:2]
+
+def require_parent(session=Depends(current_session)):
+    if session[0]!='parent': raise HTTPException(403,'Parent account required')
+    return session[1]
+
+def child_or_parent_access(student_id, session):
+    role,uid=session
+    with store.connection() as con:
+        row=con.execute('SELECT parent_id FROM students WHERE id=?',(student_id,)).fetchone()
+    if not row: raise HTTPException(404,'Child not found')
+    if (role=='child' and uid!=student_id) or (role=='parent' and uid!=row['parent_id']):
+        raise HTTPException(403,'Not authorized for this child')
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
+async def lifespan(app:FastAPI):
     store.initialize()
     yield
 
-app = FastAPI(title='E-Learning Academy API', version='0.1.0', lifespan=lifespan)
-# No permissive CORS: the Flet client uses a Python HTTP client.
+app=FastAPI(title='E-Learning Academy API',version='0.2.0',lifespan=lifespan)
 
-class StudentIn(BaseModel):
-    name: str = Field(min_length=1,max_length=50)
-    grade: str
-    avatar: str = Field(default='🌟', max_length=12)
-    language: Literal['English','Urdu'] = 'English'
+class ParentRegister(BaseModel):
+    name:str=Field(min_length=2,max_length=70)
+    email:str=Field(min_length=5,max_length=160)
+    password:str=Field(min_length=10,max_length=128)
+    @field_validator('email')
+    @classmethod
+    def valid_email(cls,v):
+        v=v.strip().lower()
+        if not re.fullmatch(r'[^\s@]+@[^\s@]+\.[^\s@]+',v): raise ValueError('Enter a valid email address')
+        return v
+
+class ParentLogin(BaseModel):
+    email:str
+    password:str
+
+class ChildIn(BaseModel):
+    name:str=Field(min_length=1,max_length=50)
+    username:str=Field(min_length=3,max_length=30,pattern=r'^[A-Za-z0-9_]+$')
+    pin:str=Field(min_length=4,max_length=8,pattern=r'^\d+$')
+    grade:str
+    avatar:str=Field(default='🌟',max_length=12)
+    language:Literal['English','Urdu']='English'
+    @field_validator('grade')
+    @classmethod
+    def validate_grade(cls,v):
+        if v not in store.GRADES: raise ValueError('Unknown grade')
+        return v
     @field_validator('name')
     @classmethod
-    def trim_name(cls,value):
-        value = value.strip()
-        if not value: raise ValueError('Name is required')
-        return value
+    def trim(cls,v):
+        if not v.strip(): raise ValueError('Name is required')
+        return v.strip()
+
+class ChildLogin(BaseModel):
+    username:str
+    pin:str
+
+class ChildUpdate(BaseModel):
+    name:str=Field(min_length=1,max_length=50)
+    username:str=Field(min_length=3,max_length=30,pattern=r'^[A-Za-z0-9_]+$')
+    pin:str|None=Field(default=None,min_length=4,max_length=8,pattern=r'^\d+$')
+    grade:str
+    avatar:str=Field(default='🌟',max_length=12)
+    language:Literal['English','Urdu']='English'
     @field_validator('grade')
     @classmethod
-    def valid_grade(cls,value):
-        if value not in store.GRADES: raise ValueError('Unknown grade')
-        return value
+    def validate_grade(cls,v):
+        if v not in store.GRADES: raise ValueError('Unknown grade')
+        return v
 
 class Question(BaseModel):
-    prompt: str = Field(min_length=1,max_length=350)
-    choices: list[str] = Field(min_length=2,max_length=5)
-    answer: int = Field(ge=0,le=4)
+    prompt:str=Field(min_length=1,max_length=350)
+    choices:list[str]=Field(min_length=2,max_length=5)
+    answer:int=Field(ge=0,le=4)
     @field_validator('choices')
     @classmethod
-    def no_blank_choices(cls,value):
-        if any(not c.strip() for c in value): raise ValueError('Choices cannot be blank')
-        return value
-    def model_post_init(self, _context):
-        if self.answer >= len(self.choices): raise ValueError('Answer index out of range')
+    def choices_nonblank(cls,v):
+        if any(not x.strip() for x in v): raise ValueError('Answer choices cannot be empty')
+        return v
+    def model_post_init(self,_context):
+        if self.answer>=len(self.choices): raise ValueError('Invalid correct answer')
 
 class LessonIn(BaseModel):
-    grade: str
-    subject: str
-    title: str = Field(min_length=1,max_length=100)
-    explanation: str = Field(min_length=1,max_length=2500)
-    emoji: str = Field(default='📚',max_length=12)
-    questions: list[Question] = Field(min_length=1,max_length=20)
+    grade:str
+    subject:str
+    title:str=Field(min_length=1,max_length=100)
+    explanation:str=Field(min_length=1,max_length=2500)
+    emoji:str=Field(default='📚',max_length=12)
+    questions:list[Question]=Field(min_length=1,max_length=30)
     @field_validator('grade')
     @classmethod
-    def grade_valid(cls,value):
-        if value not in store.GRADES: raise ValueError('Unknown grade')
-        return value
+    def valid_grade(cls,v):
+        if v not in store.GRADES: raise ValueError('Invalid grade')
+        return v
     @field_validator('subject')
     @classmethod
-    def subject_valid(cls,value):
-        if value not in store.SUBJECTS: raise ValueError('Unknown subject')
-        return value
+    def valid_subject(cls,v):
+        if v not in store.SUBJECTS: raise ValueError('Invalid subject')
+        return v
 
 class AttemptIn(BaseModel):
-    student_id: int
-    lesson_id: int
-    answers: list[int] = Field(max_length=20)
-
-class PinIn(BaseModel):
-    pin: str
-
-
-def parent_only(authorization: str|None = Header(default=None)):
-    token = authorization.removeprefix('Bearer ').strip() if authorization else ''
-    if not token or ADMIN_TOKENS.get(token,0) < time.time():
-        raise HTTPException(401,'Parent login required')
+    lesson_id:int
+    answers:list[int]=Field(min_length=1,max_length=30)
 
 @app.get('/health')
-def health():
-    return {'status':'ok'}
+def health(): return {'status':'ok'}
 
 @app.get('/catalog')
-def catalog():
-    return {'grades':store.GRADES,'subjects':store.SUBJECTS}
+def catalog(): return {'grades':store.GRADES,'subjects':store.SUBJECTS}
 
-@app.get('/students')
-def students():
+@app.post('/auth/parent/register',status_code=201)
+def register_parent(data:ParentRegister):
     with store.connection() as con:
-        return [dict(r) for r in con.execute('SELECT * FROM students ORDER BY id DESC')]
+        try:
+            first_parent=con.execute('SELECT COUNT(*) FROM parents').fetchone()[0]==0
+            cur=con.execute('INSERT INTO parents(name,email,password_hash) VALUES (?,?,?)',
+                            (data.name.strip(),data.email,hash_secret(data.password)))
+            uid=cur.lastrowid
+            # Existing v0.1 children become visible to first parent, but must
+            # be given login usernames and PINs in the parent dashboard.
+            if first_parent:
+                con.execute('UPDATE students SET parent_id=? WHERE parent_id IS NULL',(uid,))
+        except sqlite3.IntegrityError:
+            raise HTTPException(409,'Email already registered')
+    return issue_session('parent',uid)
 
-@app.post('/students',status_code=201)
-def create_student(payload:StudentIn):
+@app.post('/auth/parent/login')
+def login_parent(data:ParentLogin):
     with store.connection() as con:
-        cursor = con.execute('INSERT INTO students(name,grade,avatar,language) VALUES (?,?,?,?)',
-                 (payload.name,payload.grade,payload.avatar,payload.language))
-        return {'id':cursor.lastrowid, **payload.model_dump()}
+        row=con.execute('SELECT id,password_hash FROM parents WHERE email=? COLLATE NOCASE',
+                        (data.email.strip(),)).fetchone()
+    if not row or not verify_secret(data.password,row['password_hash']):
+        raise HTTPException(401,'Incorrect email or password')
+    return issue_session('parent',row['id'])
+
+@app.post('/auth/child/login')
+def login_child(data:ChildLogin):
+    with store.connection() as con:
+        row=con.execute('SELECT id,pin_hash FROM students WHERE username=? COLLATE NOCASE',
+                        (data.username.strip(),)).fetchone()
+    if not row or not verify_secret(data.pin,row['pin_hash']):
+        raise HTTPException(401,'Incorrect child username or PIN')
+    return issue_session('child',row['id'])
+
+@app.get('/auth/me')
+def whoami(session=Depends(current_session)):
+    role,uid=session
+    with store.connection() as con:
+        if role=='parent':
+            row=con.execute('SELECT id,name,email FROM parents WHERE id=?',(uid,)).fetchone()
+        else:
+            row=con.execute('SELECT * FROM students WHERE id=?',(uid,)).fetchone()
+    if not row: raise HTTPException(401,'Account no longer exists')
+    return {'role':role,'account':dict(row) if role=='parent' else store.student_from_row(row)}
+
+@app.post('/auth/logout')
+def logout(authorization:str|None=Header(default=None)):
+    token=authorization.removeprefix('Bearer ').strip() if authorization else ''
+    SESSIONS.pop(token,None)
+    return {'ok':True}
+
+@app.get('/children')
+def children(parent_id=Depends(require_parent)):
+    with store.connection() as con:
+        return [store.student_from_row(r) for r in con.execute('SELECT * FROM students WHERE parent_id=? ORDER BY id',(parent_id,))]
+
+@app.post('/children',status_code=201)
+def create_child(data:ChildIn,parent_id=Depends(require_parent)):
+    with store.connection() as con:
+        try:
+            c=con.execute('''INSERT INTO students(name,username,pin_hash,grade,avatar,language,parent_id)
+                VALUES(?,?,?,?,?,?,?)''',(data.name,data.username,hash_secret(data.pin),data.grade,
+                                          data.avatar,data.language,parent_id))
+        except sqlite3.IntegrityError:
+            raise HTTPException(409,'Child username already taken')
+    return {'id':c.lastrowid,**data.model_dump(exclude={'pin'})}
+
+@app.put('/children/{child_id}')
+def update_child(child_id:int,data:ChildUpdate,parent_id=Depends(require_parent)):
+    with store.connection() as con:
+        row=con.execute('SELECT parent_id FROM students WHERE id=?',(child_id,)).fetchone()
+        if not row: raise HTTPException(404,'Child not found')
+        if row['parent_id']!=parent_id: raise HTTPException(403,'Not your child account')
+        try:
+            con.execute('''UPDATE students SET name=?, username=?, grade=?, avatar=?, language=?,
+                pin_hash=COALESCE(?,pin_hash) WHERE id=?''',(data.name.strip(),data.username,
+                data.grade,data.avatar,data.language,hash_secret(data.pin) if data.pin else None,child_id))
+        except sqlite3.IntegrityError:
+            raise HTTPException(409,'Child username already taken')
+    return {'id':child_id}
 
 @app.get('/lessons')
-def lessons(grade:str|None=None,subject:str|None=None):
-    where,params = [],[]
+def lessons(grade:str|None=None,subject:str|None=None,session=Depends(current_session)):
+    where,params=[],[]
     if grade: where.append('grade=?'); params.append(grade)
     if subject: where.append('subject=?'); params.append(subject)
-    sql = 'SELECT * FROM lessons'
-    if where: sql += ' WHERE ' + ' AND '.join(where)
-    sql += ' ORDER BY id'
+    sql='SELECT * FROM lessons'
+    if where: sql+=' WHERE '+' AND '.join(where)
     with store.connection() as con:
-        return [store.lesson_from_row(r) for r in con.execute(sql,params)]
+        return [store.lesson_from_row(r) for r in con.execute(sql+' ORDER BY id',params)]
 
 @app.get('/lessons/{lesson_id}')
-def lesson(lesson_id:int):
+def lesson(lesson_id:int,session=Depends(current_session)):
     with store.connection() as con:
-        r = con.execute('SELECT * FROM lessons WHERE id=?',(lesson_id,)).fetchone()
-        if not r: raise HTTPException(404,'Lesson not found')
-        return store.lesson_from_row(r)
+        row=con.execute('SELECT * FROM lessons WHERE id=?',(lesson_id,)).fetchone()
+    if not row: raise HTTPException(404,'Lesson not found')
+    return store.lesson_from_row(row)
 
 @app.post('/attempts',status_code=201)
-def submit_attempt(payload:AttemptIn):
+def submit_attempt(data:AttemptIn,session=Depends(current_session)):
+    if session[0]!='child': raise HTTPException(403,'Log in as a child to complete quizzes')
+    student_id=session[1]
     with store.connection() as con:
-        if not con.execute('SELECT id FROM students WHERE id=?',(payload.student_id,)).fetchone():
-            raise HTTPException(404,'Student not found')
-        row = con.execute('SELECT * FROM lessons WHERE id=?',(payload.lesson_id,)).fetchone()
+        row=con.execute('SELECT * FROM lessons WHERE id=?',(data.lesson_id,)).fetchone()
         if not row: raise HTTPException(404,'Lesson not found')
-        qs = store.lesson_from_row(row)['questions']
-        if len(payload.answers) != len(qs):
-            raise HTTPException(422,'One answer required for each question')
-        if any(a<0 or a>=len(q['choices']) for a,q in zip(payload.answers,qs)):
-            raise HTTPException(422,'Invalid answer choice')
-        correct = sum(a==q['answer'] for a,q in zip(payload.answers,qs))
+        questions=store.lesson_from_row(row)['questions']
+        if len(data.answers)!=len(questions): raise HTTPException(422,'Please answer all questions')
+        if any(answer<0 or answer>=len(q['choices']) for answer,q in zip(data.answers,questions)):
+            raise HTTPException(422,'Invalid choice')
+        count=sum(answer==q['answer'] for answer,q in zip(data.answers,questions))
         con.execute('INSERT INTO attempts(student_id,lesson_id,correct,total) VALUES (?,?,?,?)',
-                (payload.student_id,payload.lesson_id,correct,len(qs)))
-        return {'correct':correct,'total':len(qs),'stars':round(3*correct/len(qs))}
+                    (student_id,data.lesson_id,count,len(questions)))
+    return {'correct':count,'total':len(questions),'stars':round(3*count/len(questions))}
 
 @app.get('/progress/{student_id}')
-def progress(student_id:int):
+def progress(student_id:int,session=Depends(current_session)):
+    child_or_parent_access(student_id,session)
     with store.connection() as con:
-        if not con.execute('SELECT id FROM students WHERE id=?',(student_id,)).fetchone():
-            raise HTTPException(404,'Student not found')
-        rows=con.execute('''SELECT l.id,l.title,l.subject,a.correct,a.total,a.created_at FROM attempts a
-                            JOIN lessons l ON l.id=a.lesson_id WHERE a.student_id=? ORDER BY a.id DESC''',(student_id,))
+        rows=con.execute('''SELECT l.id,l.title,l.subject,a.correct,a.total,a.created_at
+               FROM attempts a JOIN lessons l ON l.id=a.lesson_id
+               WHERE a.student_id=? ORDER BY a.id DESC''',(student_id,))
         attempts=[dict(r) for r in rows]
-        return {'attempts':attempts,'completed_lessons':len(set(a['id'] for a in attempts)),
-                'total_attempts':len(attempts)}
+    return {'attempts':attempts,'completed_lessons':len(set(x['id'] for x in attempts)),
+            'total_attempts':len(attempts),'total_stars':sum(round(3*x['correct']/x['total']) for x in attempts)}
 
-@app.post('/parent/login')
-def login(payload:PinIn):
-    if not secrets.compare_digest(payload.pin,PARENT_PIN):
-        raise HTTPException(401,'Incorrect parent PIN')
-    token=secrets.token_urlsafe(32)
-    ADMIN_TOKENS[token]=time.time()+3600
-    return {'access_token':token,'expires_in':3600}
-
-@app.post('/lessons',status_code=201,dependencies=[Depends(parent_only)])
-def create_lesson(payload:LessonIn):
-    import json
+@app.post('/lessons',status_code=201)
+def create_lesson(data:LessonIn,parent_id=Depends(require_parent)):
     with store.connection() as con:
         c=con.execute('''INSERT INTO lessons(grade,subject,title,explanation,emoji,questions)
-                    VALUES (?,?,?,?,?,?)''',(payload.grade,payload.subject,payload.title,payload.explanation,
-                    payload.emoji,json.dumps([q.model_dump() for q in payload.questions],ensure_ascii=False)))
-        return {'id':c.lastrowid}
+                VALUES(?,?,?,?,?,?)''',(data.grade,data.subject,data.title,data.explanation,data.emoji,
+                                      json.dumps([q.model_dump() for q in data.questions],ensure_ascii=False)))
+    return {'id':c.lastrowid}
 
-@app.put('/lessons/{lesson_id}',dependencies=[Depends(parent_only)])
-def edit_lesson(lesson_id:int,payload:LessonIn):
-    import json
+@app.put('/lessons/{lesson_id}')
+def edit_lesson(lesson_id:int,data:LessonIn,parent_id=Depends(require_parent)):
     with store.connection() as con:
-        c=con.execute('''UPDATE lessons SET grade=?,subject=?,title=?,explanation=?,emoji=?,questions=? WHERE id=?''',
-        (payload.grade,payload.subject,payload.title,payload.explanation,payload.emoji,
-         json.dumps([q.model_dump() for q in payload.questions],ensure_ascii=False),lesson_id))
-        if not c.rowcount: raise HTTPException(404,'Lesson not found')
-        return {'id':lesson_id}
+        cur=con.execute('''UPDATE lessons SET grade=?,subject=?,title=?,explanation=?,emoji=?,questions=? WHERE id=?''',
+                        (data.grade,data.subject,data.title,data.explanation,data.emoji,
+                         json.dumps([q.model_dump() for q in data.questions],ensure_ascii=False),lesson_id))
+        if not cur.rowcount: raise HTTPException(404,'Lesson not found')
+    return {'id':lesson_id}
 
-@app.delete('/lessons/{lesson_id}',dependencies=[Depends(parent_only)])
-def delete_lesson(lesson_id:int):
+@app.delete('/lessons/{lesson_id}')
+def delete_lesson(lesson_id:int,parent_id=Depends(require_parent)):
     with store.connection() as con:
-        c=con.execute('DELETE FROM lessons WHERE id=?',(lesson_id,))
-        if not c.rowcount: raise HTTPException(404,'Lesson not found')
-        return {'deleted':True}
+        cur=con.execute('DELETE FROM lessons WHERE id=?',(lesson_id,))
+        if not cur.rowcount: raise HTTPException(404,'Lesson not found')
+    return {'deleted':True}
